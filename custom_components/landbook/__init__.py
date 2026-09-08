@@ -145,20 +145,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if uid not in accounts:
         # First device for this account — create the shared MQTT client
         _refresh_lock = threading.Lock()
+        _latest_tokens = {"access": bearer_token, "refresh": refresh_tok}
 
         def _token_refresher() -> str:
             # Serialize refresh attempts — concurrent calls (proactive timer +
             # MQTT reconnect) would both read the same refresh token, but only
             # the first succeeds because the token rotates on use.
             with _refresh_lock:
-                current_token = bearer_token
-                current_refresh = refresh_tok
-                for eid in list(accounts.get(uid, {}).get("entries", set())):
-                    cfg_entry = hass.config_entries.async_get_entry(eid)
-                    if cfg_entry:
-                        current_token = cfg_entry.data.get(CONF_BEARER_TOKEN, bearer_token)
-                        current_refresh = cfg_entry.data.get(CONF_REFRESH_TOKEN, refresh_tok)
-                        break
+                current_token = _latest_tokens["access"]
+                current_refresh = _latest_tokens["refresh"]
                 try:
                     if not current_refresh:
                         raise LandbookAuthError("No refresh token on file (pre-upgrade entry) — reauth required")
@@ -177,6 +172,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 except Exception as exc:
                     _LOGGER.warning("Token refresh failed for %s (network?), will retry: %s", uid, exc)
                     raise
+                _latest_tokens["access"] = new_token
+                _latest_tokens["refresh"] = new_refresh
                 hass.loop.call_soon_threadsafe(
                     hass.async_create_task,
                     _async_persist_token_for_account(hass, uid, new_token, new_refresh),
@@ -199,7 +196,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # disconnect or a failed REST call.
         async def _proactive_token_refresh(_now: object = None) -> None:
             try:
-                await hass.async_add_executor_job(_token_refresher)
+                new_token = await hass.async_add_executor_job(_token_refresher)
+                mqtt_client.update_token(new_token)
             except Exception as exc:  # noqa: BLE001 — already logged/handled above
                 _LOGGER.debug("Proactive token refresh for %s did not succeed: %s", uid, exc)
 
