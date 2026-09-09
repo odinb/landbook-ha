@@ -89,27 +89,37 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if setup_lock is None:
         setup_lock = setup_locks[uid] = asyncio.Lock()
 
+    account_tokens = domain_data.setdefault("_account_tokens", {})
+    reauth_fired_key = f"_reauth_fired_{uid}"
+
     async with setup_lock:
-        # A sibling entry for this account may have refreshed the token while we
-        # were waiting for the lock — pick up whatever is current on our entry.
-        current_entry = hass.config_entries.async_get_entry(entry.entry_id) or entry
-        bearer_token = current_entry.data.get(CONF_BEARER_TOKEN, bearer_token)
-        refresh_tok = current_entry.data.get(CONF_REFRESH_TOKEN, refresh_tok)
+        # A sibling entry may have refreshed while we waited — prefer the
+        # in-memory store (updated synchronously under the lock) over config
+        # entries (updated asynchronously and may lag).
+        stored = account_tokens.get(uid, {})
+        bearer_token = stored.get("access") or entry.data.get(CONF_BEARER_TOKEN, bearer_token)
+        refresh_tok = stored.get("refresh") or entry.data.get(CONF_REFRESH_TOKEN, refresh_tok)
 
         try:
             properties = await async_get_tsl(bearer_token, pk, region)
         except LandbookAPIError as exc:
             if "Token validation failed" not in str(exc):
                 raise ConfigEntryNotReady(f"Could not fetch TSL model: {exc}") from exc
+
+            if domain_data.get(reauth_fired_key):
+                raise ConfigEntryNotReady(
+                    f"Token invalid for {uid}, reauth already requested — will retry"
+                )
+
             if not refresh_tok:
+                domain_data[reauth_fired_key] = True
                 entry.async_start_reauth(hass)
                 raise ConfigEntryNotReady(
                     "Token expired and no refresh token on file (pre-upgrade entry) — reauth required"
                 )
             try:
                 bearer_token, refresh_tok = await async_refresh_token(bearer_token, refresh_tok, region)
-                # Persist to all entries for this account so a sibling entry picks
-                # up the fresh pair instead of racing the now-rotated refresh token.
+                account_tokens[uid] = {"access": bearer_token, "refresh": refresh_tok}
                 for cfg_entry in hass.config_entries.async_entries(DOMAIN):
                     if cfg_entry.data.get(CONF_UID) == uid:
                         hass.config_entries.async_update_entry(
@@ -118,8 +128,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         )
                 properties = await async_get_tsl(bearer_token, pk, region)
             except LandbookAuthError as auth_exc:
-                if "rejected" in str(auth_exc).lower():
-                    entry.async_start_reauth(hass)
+                if not domain_data.get(reauth_fired_key):
+                    domain_data[reauth_fired_key] = True
+                    if "rejected" in str(auth_exc).lower():
+                        entry.async_start_reauth(hass)
                 raise ConfigEntryNotReady(f"Token expired and refresh failed: {auth_exc}") from auth_exc
             except LandbookAPIError as retry_exc:
                 raise ConfigEntryNotReady(f"Could not fetch TSL model after token refresh: {retry_exc}") from retry_exc
@@ -142,78 +154,78 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     accounts = domain_data.setdefault("_accounts", {})
 
-    if uid not in accounts:
-        # First device for this account — create the shared MQTT client
-        _refresh_lock = threading.Lock()
-        _latest_tokens = {"access": bearer_token, "refresh": refresh_tok}
+    client_locks = domain_data.setdefault("_client_locks", {})
+    client_lock = client_locks.get(uid)
+    if client_lock is None:
+        client_lock = client_locks[uid] = asyncio.Lock()
 
-        def _token_refresher() -> str:
-            # Serialize refresh attempts — concurrent calls (proactive timer +
-            # MQTT reconnect) would both read the same refresh token, but only
-            # the first succeeds because the token rotates on use.
-            with _refresh_lock:
-                current_token = _latest_tokens["access"]
-                current_refresh = _latest_tokens["refresh"]
-                try:
-                    if not current_refresh:
-                        raise LandbookAuthError("No refresh token on file (pre-upgrade entry) — reauth required")
-                    new_token, new_refresh = refresh_token(current_token, current_refresh, region)
-                except LandbookAuthError as exc:
-                    _LOGGER.warning("Token rejected for %s, triggering reauth: %s", uid, exc)
-                    accounts.get(uid, {}).get("client") and accounts[uid]["client"].halt_reconnects()
-                    for eid in list(accounts.get(uid, {}).get("entries", set())):
-                        cfg_entry = hass.config_entries.async_get_entry(eid)
-                        if cfg_entry:
-                            hass.loop.call_soon_threadsafe(
-                                hass.async_create_task,
-                                _async_trigger_reauth(hass, cfg_entry),
-                            )
-                    raise
-                except Exception as exc:
-                    _LOGGER.warning("Token refresh failed for %s (network?), will retry: %s", uid, exc)
-                    raise
-                _latest_tokens["access"] = new_token
-                _latest_tokens["refresh"] = new_refresh
-                hass.loop.call_soon_threadsafe(
-                    hass.async_create_task,
-                    _async_persist_token_for_account(hass, uid, new_token, new_refresh),
-                )
-                return new_token
+    async with client_lock:
+        if uid not in accounts:
+            # First device for this account — create the shared MQTT client
+            _refresh_lock = threading.Lock()
+            _latest_tokens = {"access": bearer_token, "refresh": refresh_tok}
 
-        mqtt_client = LandbookMQTTClient(
-            uid, bearer_token,
-            mqtt_host=region_cfg["mqtt_host"],
-            token_refresher=_token_refresher,
-        )
-        try:
-            await hass.async_add_executor_job(mqtt_client.connect)
-        except ConnectionError as exc:
-            raise ConfigEntryNotReady(f"MQTT connection failed: {exc}") from exc
+            def _token_refresher() -> str:
+                with _refresh_lock:
+                    current_token = _latest_tokens["access"]
+                    current_refresh = _latest_tokens["refresh"]
+                    try:
+                        if not current_refresh:
+                            raise LandbookAuthError("No refresh token on file (pre-upgrade entry) — reauth required")
+                        new_token, new_refresh = refresh_token(current_token, current_refresh, region)
+                    except LandbookAuthError as exc:
+                        _LOGGER.warning("Token rejected for %s, triggering reauth: %s", uid, exc)
+                        if accounts.get(uid, {}).get("client"):
+                            accounts[uid]["client"].halt_reconnects()
+                        for eid in list(accounts.get(uid, {}).get("entries", set())):
+                            cfg_entry = hass.config_entries.async_get_entry(eid)
+                            if cfg_entry:
+                                hass.loop.call_soon_threadsafe(
+                                    hass.async_create_task,
+                                    _async_trigger_reauth(hass, cfg_entry),
+                                )
+                        raise
+                    except Exception as exc:
+                        _LOGGER.warning("Token refresh failed for %s (network?), will retry: %s", uid, exc)
+                        raise
+                    _latest_tokens["access"] = new_token
+                    _latest_tokens["refresh"] = new_refresh
+                    hass.loop.call_soon_threadsafe(
+                        hass.async_create_task,
+                        _async_persist_token_for_account(hass, uid, new_token, new_refresh),
+                    )
+                    return new_token
 
-        # The access token is only valid for 2 hours and the MQTT connection
-        # can otherwise sit open well past that without ever reconnecting, so
-        # refresh proactively on a schedule instead of only reacting to a
-        # disconnect or a failed REST call.
-        async def _proactive_token_refresh(_now: object = None) -> None:
+            mqtt_client = LandbookMQTTClient(
+                uid, bearer_token,
+                mqtt_host=region_cfg["mqtt_host"],
+                token_refresher=_token_refresher,
+            )
             try:
-                new_token = await hass.async_add_executor_job(_token_refresher)
-                mqtt_client.update_token(new_token)
-            except Exception as exc:  # noqa: BLE001 — already logged/handled above
-                _LOGGER.debug("Proactive token refresh for %s did not succeed: %s", uid, exc)
+                await hass.async_add_executor_job(mqtt_client.connect)
+            except ConnectionError as exc:
+                raise ConfigEntryNotReady(f"MQTT connection failed: {exc}") from exc
 
-        cancel_proactive_refresh = async_track_time_interval(
-            hass, _proactive_token_refresh, timedelta(seconds=PROACTIVE_TOKEN_REFRESH_INTERVAL)
-        )
+            async def _proactive_token_refresh(_now: object = None) -> None:
+                try:
+                    new_token = await hass.async_add_executor_job(_token_refresher)
+                    mqtt_client.update_token(new_token)
+                except Exception as exc:  # noqa: BLE001 — already logged/handled above
+                    _LOGGER.debug("Proactive token refresh for %s did not succeed: %s", uid, exc)
 
-        accounts[uid] = {
-            "client": mqtt_client,
-            "entries": set(),
-            "cancel_proactive_refresh": cancel_proactive_refresh,
-        }
-        _LOGGER.info("Landbook: shared MQTT connection established for account %s", uid)
-    else:
-        mqtt_client = accounts[uid]["client"]
-        _LOGGER.debug("Landbook: reusing shared MQTT connection for account %s", uid)
+            cancel_proactive_refresh = async_track_time_interval(
+                hass, _proactive_token_refresh, timedelta(seconds=PROACTIVE_TOKEN_REFRESH_INTERVAL)
+            )
+
+            accounts[uid] = {
+                "client": mqtt_client,
+                "entries": set(),
+                "cancel_proactive_refresh": cancel_proactive_refresh,
+            }
+            _LOGGER.info("Landbook: shared MQTT connection established for account %s", uid)
+        else:
+            mqtt_client = accounts[uid]["client"]
+            _LOGGER.debug("Landbook: reusing shared MQTT connection for account %s", uid)
 
     accounts[uid]["entries"].add(entry.entry_id)
 
@@ -288,7 +300,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # On (re)connect, request state for ALL devices on this account
     def _request_all_states() -> None:
         for eid, edata in hass.data.get(DOMAIN, {}).items():
-            if eid in ("_accounts", "_setup_locks") or not isinstance(edata, dict):
+            if eid.startswith("_") or not isinstance(edata, dict):
                 continue
             if edata.get("uid") == uid:
                 mqtt_client.send_read(
@@ -437,6 +449,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     cancel_proactive_refresh()
                 del accounts[uid]
                 domain_data.get("_setup_locks", {}).pop(uid, None)
+                domain_data.get("_client_locks", {}).pop(uid, None)
+                domain_data.get("_account_tokens", {}).pop(uid, None)
+                domain_data.pop(f"_reauth_fired_{uid}", None)
                 _LOGGER.info("Landbook: shared MQTT connection closed for account %s", uid)
     return unload_ok
 
