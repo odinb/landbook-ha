@@ -254,11 +254,11 @@ class TestReauthFlow:
 class TestOptionsFlow:
     def _make_flow(self, entry):
         flow = LandbookOptionsFlow()
-        try:
-            flow.config_entry = entry
-        except AttributeError:
-            type(flow).config_entry = PropertyMock(return_value=entry)
-        return flow
+        with patch.object(
+            type(flow), "config_entry",
+            new_callable=PropertyMock, return_value=entry, create=True,
+        ):
+            yield flow
 
     @pytest.mark.asyncio
     async def test_options_init_returns_form(self):
@@ -266,9 +266,8 @@ class TestOptionsFlow:
         entry.options = {}
         entry.data = {}
 
-        flow = self._make_flow(entry)
-
-        result = await flow.async_step_init(None)
+        for flow in self._make_flow(entry):
+            result = await flow.async_step_init(None)
 
         assert result["type"] == "form"
         assert result["step_id"] == "init"
@@ -279,11 +278,10 @@ class TestOptionsFlow:
         entry.options = {}
         entry.data = {}
 
-        flow = self._make_flow(entry)
-
-        result = await flow.async_step_init(
-            {CONF_TEMP_UNIT: TEMP_UNIT_C, CONF_SIGNAL_STRENGTH: True}
-        )
+        for flow in self._make_flow(entry):
+            result = await flow.async_step_init(
+                {CONF_TEMP_UNIT: TEMP_UNIT_C, CONF_SIGNAL_STRENGTH: True}
+            )
 
         assert result["type"] == "create_entry"
         assert result["data"][CONF_TEMP_UNIT] == TEMP_UNIT_C
