@@ -1,7 +1,7 @@
 """Tests for config flow and options flow."""
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import pytest
 
@@ -252,14 +252,21 @@ class TestReauthFlow:
 
 
 class TestOptionsFlow:
+    def _make_flow(self, entry):
+        flow = LandbookOptionsFlow()
+        try:
+            flow.config_entry = entry
+        except AttributeError:
+            type(flow).config_entry = PropertyMock(return_value=entry)
+        return flow
+
     @pytest.mark.asyncio
     async def test_options_init_returns_form(self):
         entry = MagicMock()
         entry.options = {}
         entry.data = {}
 
-        flow = LandbookOptionsFlow()
-        flow.config_entry = entry
+        flow = self._make_flow(entry)
 
         result = await flow.async_step_init(None)
 
@@ -272,8 +279,7 @@ class TestOptionsFlow:
         entry.options = {}
         entry.data = {}
 
-        flow = LandbookOptionsFlow()
-        flow.config_entry = entry
+        flow = self._make_flow(entry)
 
         result = await flow.async_step_init(
             {CONF_TEMP_UNIT: TEMP_UNIT_C, CONF_SIGNAL_STRENGTH: True}
