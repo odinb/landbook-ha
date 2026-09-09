@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.3.11] - 2026-09-09
+
+- fix: persist latest tokens on unload and push fresh token to MQTT client (#13)
+- Gate release on test suite passing
+- Bump the actions group across 1 directory with 4 updates (#12)
+- Fix options flow tests — patch config_entry property with create=True
+- Fix options flow tests for newer HA where config_entry is read-only
+- Add CI test workflow, Dependabot config, and tests for config flow and unload- Persist latest tokens on unload and add explanatory comments (PR #13)
+
+
+
 ## [1.3.10] - 2026-09-09
 
 - Prevent spurious reauth on cold boot, guard MQTT client creation (PR #11)
