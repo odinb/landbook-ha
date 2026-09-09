@@ -190,6 +190,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         raise
                     _latest_tokens["access"] = new_token
                     _latest_tokens["refresh"] = new_refresh
+                    # Keep the in-memory account store authoritative for the
+                    # setup fast-path and the unload-time persist below.
+                    account_tokens[uid] = {"access": new_token, "refresh": new_refresh}
                     hass.loop.call_soon_threadsafe(
                         hass.async_create_task,
                         _async_persist_token_for_account(hass, uid, new_token, new_refresh),
@@ -441,7 +444,29 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if uid and uid in accounts:
             accounts[uid]["entries"].discard(entry.entry_id)
             if not accounts[uid]["entries"]:
-                # Last device for this account — disconnect
+                # Last device for this account — persist the account's latest
+                # token pair before tearing down. The runtime refresher persists
+                # rotations fire-and-forget; on a reboot or reload that task may
+                # never land, leaving entry.data with the previous (burned)
+                # refresh token and forcing a reauth at the next boot.
+                latest_tokens = domain_data.get("_account_tokens", {}).get(uid)
+                if latest_tokens and latest_tokens.get("refresh"):
+                    try:
+                        for cfg_entry in hass.config_entries.async_entries(DOMAIN):
+                            if cfg_entry.data.get(CONF_UID) == uid:
+                                hass.config_entries.async_update_entry(
+                                    cfg_entry,
+                                    data={
+                                        **cfg_entry.data,
+                                        CONF_BEARER_TOKEN: latest_tokens["access"],
+                                        CONF_REFRESH_TOKEN: latest_tokens["refresh"],
+                                    },
+                                )
+                    except Exception as exc:  # noqa: BLE001
+                        _LOGGER.warning(
+                            "Landbook: could not persist latest token for %s on unload: %s", uid, exc
+                        )
+
                 client: LandbookMQTTClient = accounts[uid]["client"]
                 await hass.async_add_executor_job(client.disconnect)
                 cancel_proactive_refresh = accounts[uid].get("cancel_proactive_refresh")
