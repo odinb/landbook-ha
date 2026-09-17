@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+import time
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry, ConfigEntryState
@@ -30,6 +31,7 @@ from .const import (
     CONF_BEARER_TOKEN,
     CONF_DEVICE_KEY,
     CONF_FW_VERSION,
+    CONF_MQTT_WATCHDOG_ENABLED,
     CONF_PRODUCT_KEY,
     CONF_REFRESH_TOKEN,
     CONF_REGION,
@@ -37,6 +39,8 @@ from .const import (
     CONF_UID,
     DISPLAY_LIGHT_HINTS,
     DOMAIN,
+    MQTT_WATCHDOG_CHECK_INTERVAL,
+    MQTT_WATCHDOG_STALE_INTERVAL,
     PROACTIVE_TOKEN_REFRESH_INTERVAL,
     SIGNAL_STRENGTH_POLL_INTERVAL,
     TEMPERATURE_NAME_HINTS,
@@ -220,10 +224,42 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 hass, _proactive_token_refresh, timedelta(seconds=PROACTIVE_TOKEN_REFRESH_INTERVAL)
             )
 
+            def _account_watchdog_enabled() -> bool:
+                for eid in list(accounts.get(uid, {}).get("entries", set())):
+                    cfg_entry = hass.config_entries.async_get_entry(eid)
+                    if cfg_entry and cfg_entry.options.get(CONF_MQTT_WATCHDOG_ENABLED, True):
+                        return True
+                return False
+
+            async def _mqtt_watchdog(_now: object = None) -> None:
+                try:
+                    if not _account_watchdog_enabled():
+                        return
+                    acct = accounts.get(uid)
+                    last = acct.get("last_activity") if acct else None
+                    if last is None:
+                        return
+                    if time.monotonic() - last > MQTT_WATCHDOG_STALE_INTERVAL:
+                        _LOGGER.warning(
+                            "Landbook: no MQTT message for account %s in %.0fs — forcing reconnect",
+                            uid, MQTT_WATCHDOG_STALE_INTERVAL,
+                        )
+                        await hass.async_add_executor_job(mqtt_client.reconnect)
+                        if accounts.get(uid):
+                            accounts[uid]["last_activity"] = time.monotonic()
+                except Exception as exc:  # noqa: BLE001
+                    _LOGGER.debug("MQTT watchdog for %s failed: %s", uid, exc)
+
+            cancel_watchdog = async_track_time_interval(
+                hass, _mqtt_watchdog, timedelta(seconds=MQTT_WATCHDOG_CHECK_INTERVAL)
+            )
+
             accounts[uid] = {
                 "client": mqtt_client,
                 "entries": set(),
                 "cancel_proactive_refresh": cancel_proactive_refresh,
+                "cancel_watchdog": cancel_watchdog,
+                "last_activity": time.monotonic(),
             }
             _LOGGER.info("Landbook: shared MQTT connection established for account %s", uid)
         else:
@@ -255,6 +291,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         entry_data = hass.data.get(DOMAIN, {}).get(entry.entry_id)
         if entry_data is None:
             return
+
+        accounts = hass.data.get(DOMAIN, {}).get("_accounts", {})
+        if accounts.get(uid):
+            accounts[uid]["last_activity"] = time.monotonic()
 
         if suffix == "bus_":
             data_block = payload.get("data", payload)
@@ -480,6 +520,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 cancel_proactive_refresh = acct.get("cancel_proactive_refresh")
                 if cancel_proactive_refresh:
                     cancel_proactive_refresh()
+                cancel_watchdog = acct.get("cancel_watchdog")
+                if cancel_watchdog:
+                    cancel_watchdog()
                 accounts.pop(uid, None)
                 domain_data.get("_setup_locks", {}).pop(uid, None)
                 domain_data.get("_client_locks", {}).pop(uid, None)
